@@ -15,3 +15,5 @@ endif()
 if(PLAYERBOTS)
     add_subdirectory(Bots)
 endif()
+
+add_subdirectory(AuctionHouseBot)

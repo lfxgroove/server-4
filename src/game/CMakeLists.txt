@@ -20,7 +20,6 @@ add_definitions(-DDT_POLYREF64)
 
 include_directories(
   "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/AuctionHouseBot"
   "${CMAKE_CURRENT_SOURCE_DIR}/BattleGround"
   "${CMAKE_CURRENT_SOURCE_DIR}/ChatCommands"
   "${CMAKE_CURRENT_SOURCE_DIR}/Maps"
@@ -54,13 +53,6 @@ include_directories(
   "${MYSQL_INCLUDE_DIR}"
   "${OPENSSL_INCLUDE_DIR}"
   "${ACE_INCLUDE_DIR}"
-)
-
-#AH Bot group
-file(GLOB SRC_GRP_AHBOT AuctionHouseBot/*.cpp AuctionHouseBot/*.h)
-source_group("AhBot"
-  FILES
-    ${SRC_GRP_AHBOT}
 )
 
 #Battlegrounds group
@@ -212,8 +204,6 @@ endif()
 if(PCH)
     ADD_CXX_PCH(${LIBRARY_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/pchdef.h ${CMAKE_CURRENT_SOURCE_DIR}/pchdef.cpp)
 endif()
-
-add_subdirectory(AuctionHouseBot)
 
 if(PLAYERBOTS)
     include_directories(
