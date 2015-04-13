@@ -35,6 +35,8 @@
 #include "revision.h"
 #include "Util.h"
 
+#include "AuctionHouseBot.h"
+
 #include <ace/Get_Opt.h>
 
 #ifdef WIN32
@@ -81,42 +83,46 @@ bool ChatHandler::HandleAccountCreateCommand(char* args) {}
 bool ChatHandler::HandleServerLogFilterCommand(char* args) {}
 bool ChatHandler::HandleServerLogLevelCommand(char* args) {}
 
-
 bool StartDB();
 void PingDatabases();
 void HaltDelayThreads();
 void AllowAsyncTransactions();
 void UnhookSignals();
 void HookSignals();
+void MainLoop();
+bool CreatePid();
+void SetProcessPriority();
+void CheckConfigFileVersion();
 
-bool stopEvent = false;                                     ///< Setting it to true stops the server
+/// Setting it to true stops the server
+bool stopEvent = false;
 
 /**
  * These are needed by the auctionhouse bot and it's dependencies, 
  * mostly the sAuctionMgr
  */
-DatabaseType WorldDatabase;                                 ///< Accessor to the world database
-DatabaseType CharacterDatabase;                             ///< Accessor to the character database
-DatabaseType LoginDatabase;                                 ///< Accessor to the realm/login database
-
+DatabaseType WorldDatabase;      ///< Accessor to the world database
+DatabaseType CharacterDatabase;  ///< Accessor to the character database
+DatabaseType LoginDatabase;      ///< Accessor to the realm/login database
 
 /// Print out the usage string for this program on the console.
 void usage(const char* prog)
 {
-    sLog.outString("Usage: \n %s [<options>]\n"
-                   "    -v, --version            print version and exit\n\r"
-                   "    -c config_file           use config_file as configuration file\n\r"
+    sLog.outString(
+        "Usage: \n %s [<options>]\n"
+        "    -v, --version            print version and exit\n\r"
+        "    -c config_file           use config_file as configuration file\n\r"
 #ifdef WIN32
-                   "    Running as service functions:\n\r"
-                   "    -s run                   run as service\n\r"
-                   "    -s install               install service\n\r"
-                   "    -s uninstall             uninstall service\n\r"
+        "    Running as service functions:\n\r"
+        "    -s run                   run as service\n\r"
+        "    -s install               install service\n\r"
+        "    -s uninstall             uninstall service\n\r"
 #else
-                   "    Running as daemon functions:\n\r"
-                   "    -s run                   run as daemon\n\r"
-                   "    -s stop                  stop daemon\n\r"
+        "    Running as daemon functions:\n\r"
+        "    -s run                   run as daemon\n\r"
+        "    -s stop                  stop daemon\n\r"
 #endif
-                   , prog);
+        , prog);
 }
 
 /// Launch the realm server
@@ -132,6 +138,7 @@ int main(int argc, char** argv)
 
     char serviceDaemonMode = '\0';
 
+    //TODO: Move top ReadOptions or something
     int option;
     while ((option = cmd_opts()) != EOF)
     {
@@ -218,11 +225,121 @@ int main(int argc, char** argv)
 #endif
 
     sLog.Initialize();
-
+    
     sLog.outString("%s [auctionhousebot-daemon]", REVISION_NR);
     sLog.outString("<Ctrl-C> to stop.\n");
     sLog.outString("Using configuration file %s.", cfg_file);
 
+    CheckConfigFileVersion();
+
+    DETAIL_LOG("Using ACE: %s", ACE_VERSION);
+
+    if (!CreatePid())
+    {
+        return 1;
+    }
+
+    if (!StartDB())
+    {
+        return 1;
+    }
+
+    ///- Catch termination signals
+    HookSignals();
+
+    ///- Handle affinity for multiple processors and process priority on Windows
+    SetProcessPriority();
+
+    // server has started up successfully => enable async DB requests
+    AllowAsyncTransactions();
+
+#ifndef WIN32
+    detachDaemon();
+#endif
+
+    MainLoop();
+
+    ///- Wait for the delay thread to exit
+    HaltDelayThreads();
+
+    ///- Remove signal handling before leaving
+    UnhookSignals();
+
+    sLog.outString("Halting process...");
+    return 0;
+}
+
+/**
+ * Does all the main work, calls \ref AuctionHouseBot::Update
+ */
+void MainLoop()
+{
+    // maximum counter for next ping to the db's
+    uint32 numLoops = (sConfig.GetIntDefault("MaxPingTime", 30) * (MINUTE * 1000000 / 100000));
+    uint32 loopCounter = 0;
+    
+    ///- Wait for termination signal
+    uint32 diff = WorldTimer::tick();
+    //We want to sleep up until 5000 ms has passed since the last
+    //iteration
+    const uint32 sleepGoal = 5000;
+    while (!stopEvent)
+    {
+        diff = WorldTimer::tick();
+        if (diff < sleepGoal)
+        {
+            ACE_Based::Thread::Sleep(sleepGoal - diff);
+        }
+        //We tick to get the time after the sleep so that we sleep
+        //properly the next time around
+        WorldTimer::tick();
+
+        sAuctionBot.Update();
+
+        if ((++loopCounter) == numLoops)
+        {
+            loopCounter = 0;
+            DETAIL_LOG("Ping MySQL to keep connection alive");
+            PingDatabases();
+        }
+
+#ifdef WIN32
+        if (m_ServiceStatus == 0) { stopEvent = true; }
+        while (m_ServiceStatus == 2) { Sleep(1000); }
+#endif
+    }
+
+}
+
+/**
+ * Creates a process id file if the config file contains a name for
+ * that file. 
+ */
+bool CreatePid()
+{
+    std::string pidFile = sConfig.GetStringDefault("PidFile", "");
+    if (!pidFile.empty())
+    {
+        uint32 pid = CreatePIDFile(pidFile);
+        if (!pid)
+        {
+            sLog.outError("Can not create PID file %s.\n",
+                          pidFile.c_str());
+            Log::WaitBeforeContinueIfNeed();
+            return false;
+        }
+
+        sLog.outString("Daemon PID: %u\n", pid);
+    }
+    return true;
+}
+
+/**
+ * Checks the config file version and prints a small warning if it's
+ * out of date. We start even if it is though.
+ */
+void CheckConfigFileVersion()
+{
     ///- Check the version of the configuration file
     uint32 confVersion = sConfig.GetIntDefault("ConfVersion", 0);
     if (confVersion < AUCTIONHOUSEBOT_CONFIG_VERSION)
@@ -234,46 +351,14 @@ int main(int argc, char** argv)
         sLog.outError("*****************************************************************************");
         Log::WaitBeforeContinueIfNeed();
     }
+}
 
-    DETAIL_LOG("Using ACE: %s", ACE_VERSION);
-
-// #if defined (ACE_HAS_EVENT_POLL) || defined (ACE_HAS_DEV_POLL)
-//     ACE_Reactor::instance(new ACE_Reactor(new ACE_Dev_Poll_Reactor(ACE::max_handles(), 1), 1), true);
-// #else
-//     ACE_Reactor::instance(new ACE_Reactor(new ACE_TP_Reactor(), true), true);
-// #endif
-
-//     sLog.outBasic("Max allowed open files is %d", ACE::max_handles());
-
-    /// realmd PID file creation
-    std::string pidfile = sConfig.GetStringDefault("PidFile", "");
-    if (!pidfile.empty())
-    {
-        uint32 pid = CreatePIDFile(pidfile);
-        if (!pid)
-        {
-            sLog.outError("Can not create PID file %s.\n", pidfile.c_str());
-            Log::WaitBeforeContinueIfNeed();
-            return 1;
-        }
-
-        sLog.outString("Daemon PID: %u\n", pid);
-    }
-
-    ///- Initialize the database connection
-    if (!StartDB())
-    {
-        Log::WaitBeforeContinueIfNeed();
-        return 1;
-    }
-
-    ///- Get the list of realms for the server
-    // sRealmList.Initialize(sConfig.GetIntDefault("RealmsStateUpdateDelay", 20));
-
-    ///- Catch termination signals
-    HookSignals();
-
-    ///- Handle affinity for multiple processors and process priority on Windows
+/**
+ * Changes the process priority of the currently running process,
+ * only implemented for windows.
+ */
+void SetProcessPriority()
+{
 #ifdef WIN32
     {
         HANDLE hProcess = GetCurrentProcess();
@@ -295,9 +380,9 @@ int main(int argc, char** argv)
                 else
                 {
                     if (SetProcessAffinityMask(hProcess, curAff))
-                        { sLog.outString("Using processors (bitmask, hex): %x", curAff); }
+                    { sLog.outString("Using processors (bitmask, hex): %x", curAff); }
                     else
-                        { sLog.outError("Can't set used processors (hex): %x", curAff); }
+                    { sLog.outError("Can't set used processors (hex): %x", curAff); }
                 }
             }
             sLog.outString();
@@ -308,49 +393,13 @@ int main(int argc, char** argv)
         if (Prio)
         {
             if (SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS))
-                { sLog.outString("ahbotd process priority class set to HIGH"); }
+            { sLog.outString("ahbotd process priority class set to HIGH"); }
             else
-                { sLog.outError("Can't set ahbotd process priority class."); }
+            { sLog.outError("Can't set ahbotd process priority class."); }
             sLog.outString();
         }
     }
 #endif
-
-    // server has started up successfully => enable async DB requests
-    AllowAsyncTransactions();
-
-    // maximum counter for next ping
-    uint32 numLoops = (sConfig.GetIntDefault("MaxPingTime", 30) * (MINUTE * 1000000 / 100000));
-    uint32 loopCounter = 0;
-
-#ifndef WIN32
-    detachDaemon();
-#endif
-    ///- Wait for termination signal
-    while (!stopEvent)
-    {
-        //TODO: Main loop stuff here!
-
-        if ((++loopCounter) == numLoops)
-        {
-            loopCounter = 0;
-            DETAIL_LOG("Ping MySQL to keep connection alive");
-            PingDatabases();
-        }
-#ifdef WIN32
-        if (m_ServiceStatus == 0) { stopEvent = true; }
-        while (m_ServiceStatus == 2) { Sleep(1000); }
-#endif
-    }
-
-    ///- Wait for the delay thread to exit
-    HaltDelayThreads();
-
-    ///- Remove signal handling before leaving
-    UnhookSignals();
-
-    sLog.outString("Halting process...");
-    return 0;
 }
 
 /// Handle termination signals
@@ -446,6 +495,7 @@ bool StartDB()
         if (dbConfig.empty())
         {
             sLog.outError("Database not specified in configuration file");
+            Log::WaitBeforeContinueIfNeed();
             return false;
         }
         sLog.outString("%s total connections: %i",
@@ -457,15 +507,19 @@ bool StartDB()
             sLog.outError("Can not connect to %s %s",
                           dbInfo.name.c_str(),
                           dbConfig.c_str());
+            Log::WaitBeforeContinueIfNeed();
             return false;
         }
 
-        if (!db.CheckRequiredField("db_version", dbInfo.version.c_str()))
-        {
-            ///- Wait for already started DB delay threads to end
-            WorldDatabase.HaltDelayThread();
-            return false;
-        }
+        sLog.outError("TODO: Actually check the db version..");
+        //TODO: Different names of these fields in the different
+        //dbs..
+        // if (!db.CheckRequiredField("db_version", dbInfo.version.c_str()))
+        // {
+        //     ///- Wait for already started DB delay threads to end
+        //     WorldDatabase.HaltDelayThread();
+        //     return false;
+        // }
     }
     return true;
 }
