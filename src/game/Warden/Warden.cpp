@@ -51,9 +51,26 @@ Warden::~Warden()
     _initialized = false;
 }
 
+void Warden::RequestHash()
+{
+    sLog.outWarden("Request hash");
+
+    // Create packet structure
+    WardenHashRequest Request;
+    Request.Command = WARDEN_SMSG_HASH_REQUEST;
+    memcpy(Request.Seed, _seed, 16);
+
+    // Encrypt with warden RC4 key.
+    EncryptData((uint8*)&Request, sizeof(WardenHashRequest));
+
+    WorldPacket pkt(SMSG_WARDEN_DATA, sizeof(WardenHashRequest));
+    pkt.append((uint8*)&Request, sizeof(WardenHashRequest));
+    _session->SendPacket(&pkt);
+}
+
 void Warden::SendModuleToClient()
 {
-    sLog.outError("[Warden]: Send module to client");
+    sLog.outWarden("Send module to client");
 
     // Create packet structure
     WardenModuleTransfer packet;
@@ -79,7 +96,7 @@ void Warden::SendModuleToClient()
 
 void Warden::RequestModule()
 {
-    sLog.outError("[Warden]: Request module");
+    sLog.outWarden("Request module");
 
     // Create packet structure
     WardenModuleUse request;
@@ -107,14 +124,14 @@ void Warden::Update()
 
         if (_dataSent)
         {
-            uint32 maxClientResponseDelay = sWorld.getConfig(CONFIG_INT32_WARDEN_CLIENT_RESPONSE_DELAY);
+            uint32 maxClientResponseDelay = sWorld.getConfig(CONFIG_UINT32_WARDEN_CLIENT_RESPONSE_DELAY);
 
             if (maxClientResponseDelay > 0)
             {
                 // Kick player if client response delays more than set in config
                 if (_clientResponseTimer > maxClientResponseDelay * IN_MILLISECONDS)
                 {
-                    sLog.outError("[Warden]: %s (latency: %u, IP: %s) exceeded Warden module response delay for more than %s - disconnecting client",
+                    sLog.outWarden("%s (latency: %u, IP: %s) exceeded Warden module response delay for more than %s - disconnecting client",
                         _session->GetPlayerName(), _session->GetLatency(), _session->GetRemoteAddress().c_str(), secsToTimeString(maxClientResponseDelay, true).c_str());
                     _session->KickPlayer();
                 }
@@ -150,12 +167,12 @@ bool Warden::IsValidCheckSum(uint32 checksum, const uint8* data, const uint16 le
 
     if (checksum != newChecksum)
     {
-        sLog.outError("[Warden]: CHECKSUM IS NOT VALID");
+        sLog.outWarden("CHECKSUM IS NOT VALID");
         return false;
     }
     else
     {
-        sLog.outError("[Warden]: CHECKSUM IS VALID");
+        sLog.outWarden("CHECKSUM IS VALID");
         return true;
     }
 }
@@ -193,7 +210,7 @@ std::string Warden::Penalty(WardenCheck* check /*= NULL*/)
     if (check)
         action = check->Action;
     else
-        action = WardenActions(sWorld.getConfig(CONFIG_INT32_WARDEN_CLIENT_FAIL_ACTION));
+        action = WardenActions(sWorld.getConfig(CONFIG_UINT32_WARDEN_CLIENT_FAIL_ACTION));
 
     switch (action)
     {
@@ -215,7 +232,7 @@ std::string Warden::Penalty(WardenCheck* check /*= NULL*/)
             if (check)
                 banReason << ": " << check->Comment << " (CheckId: " << check->CheckId << ")";
 
-            sWorld.BanAccount(BAN_ACCOUNT, accountName, sWorld.getConfig(CONFIG_INT32_WARDEN_CLIENT_BAN_DURATION), banReason.str(), "Server");
+            sWorld.BanAccount(BAN_ACCOUNT, accountName, sWorld.getConfig(CONFIG_UINT32_WARDEN_CLIENT_BAN_DURATION), banReason.str(), "Warden");
 
             return "Ban";
         }
@@ -233,7 +250,7 @@ void WorldSession::HandleWardenDataOpcode(WorldPacket& recvData)
     _warden->DecryptData(const_cast<uint8*>(recvData.contents()), recvData.size());
     uint8 opcode;
     recvData >> opcode;
-    sLog.outError("[Warden]: Got packet, opcode %02X, size %u", opcode, uint32(recvData.size()));
+    sLog.outWarden("Got packet, opcode %02X, size %u", opcode, uint32(recvData.size()));
     recvData.hexlike();
 
     switch (opcode)
@@ -248,17 +265,58 @@ void WorldSession::HandleWardenDataOpcode(WorldPacket& recvData)
             _warden->HandleData(recvData);
             break;
         case WARDEN_CMSG_MEM_CHECKS_RESULT:
-            sLog.outError("[Warden]: NYI WARDEN_CMSG_MEM_CHECKS_RESULT received!");
+            sLog.outWarden("NYI WARDEN_CMSG_MEM_CHECKS_RESULT received!");
             break;
         case WARDEN_CMSG_HASH_RESULT:
             _warden->HandleHashResult(recvData);
             _warden->InitializeModule();
             break;
         case WARDEN_CMSG_MODULE_FAILED:
-            sLog.outError("[Warden]: NYI WARDEN_CMSG_MODULE_FAILED received!");
+            sLog.outWarden("NYI WARDEN_CMSG_MODULE_FAILED received!");
             break;
         default:
-            sLog.outError("[Warden]: Got unknown warden opcode %02X of size %u.", opcode, uint32(recvData.size() - 1));
+            sLog.outWarden("Got unknown warden opcode %02X of size %u.", opcode, uint32(recvData.size() - 1));
             break;
     }
+}
+
+void Warden::HandleData(ByteBuffer& /*buff*/)
+{
+    // Set hold off timer, minimum timer should at least be 1 second
+    uint32 holdOff = sWorld.getConfig(CONFIG_UINT32_WARDEN_CLIENT_CHECK_HOLDOFF);
+    _checkTimer = (holdOff < 1 ? 1 : holdOff) * IN_MILLISECONDS;
+}
+
+void Warden::LogPositiveToDB(WardenCheck* check)
+{
+    if (!check || !_session)
+        return;
+
+    if (uint32(check->Action) < sWorld.getConfig(CONFIG_UINT32_WARDEN_DB_LOGLEVEL))
+        return;
+
+    static SqlStatementID insWardenPositive;
+
+    SqlStatement stmt = LoginDatabase.CreateStatement(insWardenPositive, "INSERT INTO warden_log (`check`, `action`, `account`, `guid`, `map`, `position_x`, `position_y`, `position_z`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+
+    stmt.addUInt8(check->CheckId);
+    stmt.addInt8(check->Action);
+    stmt.addUInt32(_session->GetAccountId());
+    if (Player* pl = _session->GetPlayer())
+    {
+        stmt.addUInt64(pl->GetObjectGuid().GetRawValue());
+        stmt.addUInt32(pl->GetMapId());
+        stmt.addFloat(pl->GetPositionX());
+        stmt.addFloat(pl->GetPositionY());
+        stmt.addFloat(pl->GetPositionZ());
+    }
+    else
+    {
+        stmt.addUInt64(0);
+        stmt.addUInt32(0xFFFFFFFF);
+        stmt.addFloat(0.0f);
+        stmt.addFloat(0.0f);
+        stmt.addFloat(0.0f);
+    }
+    stmt.Execute();
 }
